@@ -11,6 +11,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -26,6 +27,8 @@ type Nodejs struct {
 	serverCmd   *exec.Cmd
 	serverAddr  string
 	timeout     time.Duration
+
+	logger *zap.Logger
 }
 
 func (Nodejs) CaddyModule() caddy.ModuleInfo {
@@ -35,11 +38,19 @@ func (Nodejs) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+func (n *Nodejs) Provision(ctx caddy.Context) error {
+	n.logger = ctx.Logger(n)
+	return nil
+}
+
 func (n *Nodejs) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	n.logger.Debug("Handling request")
+
 	n.serverMutex.Lock()
 	defer n.serverMutex.Unlock()
 
 	if n.serverCmd == nil || n.serverCmd.ProcessState != nil && n.serverCmd.ProcessState.Exited() {
+		n.logger.Debug("Starting new server")
 		err := n.startServer()
 		if err != nil {
 			return fmt.Errorf("failed to start node.js server: %v", err)
@@ -69,6 +80,7 @@ func (n *Nodejs) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	io.Copy(w, resp.Body)
 
 	if time.Since(n.lastActive) > n.timeout {
+		n.logger.Debug("Server inactive, stopping server")
 		n.stopServer()
 	}
 
@@ -84,11 +96,14 @@ func (n *Nodejs) startServer() error {
 	n.serverAddr = "http://localhost:3000"
 	n.timeout = 1 * time.Minute
 
+	n.logger.Debug("Server started")
+
 	go func() {
 		<-time.After(n.timeout)
 		n.serverMutex.Lock()
 		defer n.serverMutex.Unlock()
 		if time.Since(n.lastActive) > n.timeout {
+			n.logger.Debug("Server timed out, stopping server")
 			n.stopServer()
 		}
 	}()
@@ -101,6 +116,7 @@ func (n *Nodejs) stopServer() {
 		n.serverCmd.Process.Kill()
 		n.serverCmd.Process.Release()
 		n.serverCmd = nil
+		n.logger.Debug("Server stopped")
 	}
 }
 
