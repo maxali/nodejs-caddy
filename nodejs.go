@@ -1,16 +1,16 @@
 package nodejs
 
 import (
-	"context"
 	"fmt"
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"io"
 	"net/http"
 	"os/exec"
 	"sync"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 func init() {
@@ -118,5 +118,5 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			}
 		}
 	}
-	return n, nil
+	return &n, nil
 }
