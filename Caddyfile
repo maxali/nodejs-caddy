@@ -3,9 +3,16 @@
 	order nodejs first
 }
 
-
 http://localhost:8080 {
 	nodejs {
 		file C:\Users\mohabdi\go\src\github.com\maxali\nodejs-caddy\server.js
+		port 9000
+	}
+}
+
+http://localhost:8081 {
+	nodejs {
+		file C:\Users\mohabdi\go\src\github.com\maxali\nodejs-caddy\server.js
+		port 9001
 	}
 }
