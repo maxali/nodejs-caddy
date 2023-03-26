@@ -1,13 +1,21 @@
 # Caddy Node.js Plugin
 
-The Caddy Node.js Plugin allows you to run multiple instances of Node.js applications as reverse proxies using the Caddy HTTP server. It automatically starts and stops Node.js instances based on incoming requests and provides a simple configuration interface to manage your Node.js applications.
+The Caddy Node.js Plugin allows you to run serverless Node.js applications with Caddy, by managing the lifecycle of your Node.js HTTP server instances. It starts a new server instance when needed, stops it after a specified idle timeout, and proxies incoming requests to the running instance.
+
+It automatically starts and stops Node.js instances based on incoming requests and provides a simple configuration interface to manage your Node.js applications.
 
 # Features
 
 - Reverse proxy for Node.js applications
-- Automatic start and stop of Node.js instances based on request traffic
+- Automatically starts a new Node.js HTTP server instance when needed
+- Proxies incoming requests to the running Node.js server instance
+- Stops the server instance after a specified idle timeout
 - Support for multiple instances of Node.js applications with different configurations
-- Easy configuration using Caddyfile
+- Lightweight and easy to integrate with existing Caddy configurations
+
+# Prerequisites
+
+- [Caddy v2](https://caddyserver.com/docs/install)
 
 # Installation
 
