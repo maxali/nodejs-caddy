@@ -3,6 +3,8 @@ package nodejs
 import (
 	"fmt"
 	"io"
+	"math/rand"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -267,9 +269,28 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		}
 	}
 
+	// If the port is not specified, assign a random port in the range 9000-9999
 	if n.Port == 0 {
-		n.Port = 3000
+		port, err := getRandomPort(9000, 9999)
+		if err != nil {
+			return nil, h.Errf("could not find an available port: %v", err)
+		}
+		n.Port = port
 	}
 
 	return &n, nil
+}
+
+func getRandomPort(min, max int) (int, error) {
+	rand.Seed(time.Now().UnixNano())
+	for i := 0; i < 100; i++ {
+		port := rand.Intn(max-min+1) + min
+		address := fmt.Sprintf(":%d", port)
+		listener, err := net.Listen("tcp", address)
+		if err == nil {
+			listener.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("could not find an available port in the range %d-%d", min, max)
 }
