@@ -3,11 +3,7 @@ package nodejs
 import (
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +12,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	docker "github.com/fsouza/go-dockerclient"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -39,16 +36,17 @@ func init() {
 }
 
 type Nodejs struct {
-	File          string
-	Port          int
-	serverStopped bool
-	serverReady   sync.WaitGroup
-	serverMutex   sync.Mutex
-	lastActive    time.Time
-	serverCmd     *exec.Cmd
-	serverAddr    string
-	timeout       time.Duration
-	logger        *zap.Logger
+	Port        int
+	serverMutex sync.Mutex
+	lastActive  time.Time
+	serverAddr  string
+	timeout     time.Duration
+	logger      *zap.Logger
+
+	App         string
+	Entrypoint  string
+	Command     string
+	containerID string
 }
 
 func (n *Nodejs) CaddyModule() caddy.ModuleInfo {
@@ -69,153 +67,116 @@ func (n *Nodejs) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (n *Nodejs) startServer() error {
-	n.logger.Debug("Starting server")
-
-	// Initialize the serverCmd field
-	cmd := exec.Command("node", n.File)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", n.Port))
-
-	stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel}
-	stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel}
-
-	cmd.Stdout = stdoutLogWriter
-	cmd.Stderr = stderrLogWriter
-
-	// Set the serverCmd field
-	n.serverCmd = cmd
-	n.serverStopped = false
-
-	// Initialize the serverReady WaitGroup
-	n.serverReady.Add(1)
-
-	// Start the server
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start server: %v", err)
+func newDockerClient() (*docker.Client, error) {
+	client, err := docker.NewClientFromEnv()
+	if err != nil {
+		return nil, err
 	}
-	n.logger.Debug(fmt.Sprintf("Started server with Pid: %d", n.serverCmd.Process.Pid))
-
-	// Wait for the server to be ready in a separate goroutine
-	go func() {
-		n.logger.Debug("Waiting for starting server")
-
-		for {
-			conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", n.Port))
-
-			if err == nil {
-				n.logger.Debug("Connection: " + conn.LocalAddr().String())
-
-				conn.Close()
-				n.logger.Debug("Server is ready") // Add this line to log when the server is ready
-				n.serverReady.Done()
-				break
-			}
-			n.logger.Debug("Server not ready yet, retrying...") // Add this line to log when the server is not ready
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-	// Set the server address
-	n.serverAddr = fmt.Sprintf("http://localhost:%d", n.Port)
-
-	n.logger.Debug(fmt.Sprintf("Started server with Pid: %d", n.serverCmd.Process.Pid))
-	// Start monitoring the idle time of the server
-	go n.monitorIdleTime(n.serverCmd.Process.Pid)
-
-	return nil
+	return client, nil
 }
 
-func (n *Nodejs) stopServer(pid int, lockAcquired bool) {
-	n.logger.Debug("Stopping server", zap.Int("pid", pid))
+func (n *Nodejs) startServer(lockAcquired bool) error {
 	if !lockAcquired {
 		n.serverMutex.Lock()
 		defer n.serverMutex.Unlock()
 	}
 
-	// Find the process with the specified process ID
-	process, err := os.FindProcess(pid)
-	if err == nil {
-		n.logger.Debug("Found process", zap.Int("pid", process.Pid))
-		// First, try to send an os.Interrupt signal
-		var signal os.Signal
-		if runtime.GOOS == "windows" {
-			signal = os.Kill
-		} else {
-			signal = os.Interrupt
-		}
-		err := process.Signal(signal)
-		if err != nil {
-			n.logger.Error("Failed to send interrupt signal", zap.Error(err))
-			// If os.Interrupt fails, try to send an os.Kill signal
-			err = process.Signal(os.Kill)
-			if err != nil {
-				n.logger.Error("Failed to send kill signal", zap.Error(err))
-			}
-		}
-	} else {
-		n.logger.Error("Failed to find process", zap.Error(err))
+	// Create a new Docker client
+	client, err := newDockerClient()
+	if err != nil {
+		return fmt.Errorf("failed to create Docker client: %v", err)
 	}
 
-	// Wait for the serverCmd process to exit with a timeout
-	if n.serverCmd != nil && n.serverCmd.Process != nil && n.serverCmd.Process.Pid == pid {
-		done := make(chan struct{})
-		go func() {
-			_, err := n.serverCmd.Process.Wait()
-			if err != nil {
-				n.logger.Error("Error waiting for process", zap.Error(err))
-			}
-			close(done)
-		}()
-		select {
-		case <-time.After(5 * time.Second): // Adjust timeout duration as needed
-			n.logger.Error("Waiting for server to stop timed out")
-			if err := process.Signal(os.Kill); err != nil {
-				n.logger.Error("Failed to kill the process", zap.Error(err))
-			}
-		case <-done:
-			n.logger.Debug("Server stopped", zap.Int("pid", pid))
-			n.serverStopped = true
-		}
-	} else {
-		n.logger.Debug("Server not found or mismatching PIDs", zap.Int("serverCmd pid", n.serverCmd.Process.Pid), zap.Int("pid", pid))
+	// Set up the container configuration
+	config := &docker.Config{
+		Image:        "maxali/node:14",
+		Entrypoint:   []string{n.Entrypoint},
+		Cmd:          []string{n.Command},
+		ExposedPorts: map[docker.Port]struct{}{docker.Port(fmt.Sprintf("%d/tcp", n.Port)): {}},
+		Env: []string{
+			fmt.Sprintf("ENTRY_COMMAND=%s", n.Entrypoint),
+			fmt.Sprintf("APP_ENTRY_FILE=%s", n.Command),
+			fmt.Sprintf("PORT=%d", n.Port),
+		},
 	}
 
-	n.logger.Debug("Server stopped", zap.Int("pid", pid))
+	hostConfig := &docker.HostConfig{
+		Binds:        []string{fmt.Sprintf("%s:/app", n.App)},
+		PortBindings: map[docker.Port][]docker.PortBinding{docker.Port(fmt.Sprintf("%d/tcp", n.Port)): {{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", n.Port)}}},
+	}
+
+	// Create and start the container
+	container, err := client.CreateContainer(docker.CreateContainerOptions{
+		Config:     config,
+		HostConfig: hostConfig,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create Docker container: %v", err)
+	}
+
+	err = client.StartContainer(container.ID, hostConfig)
+	if err != nil {
+		return fmt.Errorf("failed to start Docker container: %v", err)
+	}
+
+	n.logger.Debug("Container started with Id " + container.ID)
+	n.containerID = container.ID
+
+	// Set the server address
+	n.serverAddr = fmt.Sprintf("http://localhost:%d", n.Port)
+
+	go n.monitorIdleTime()
+	n.logger.Debug("Server started.")
+
+	return nil
+}
+
+func (n *Nodejs) stopServer(lockAcquired bool) {
+	n.logger.Debug("Stopping server")
+
+	if !lockAcquired {
+		n.serverMutex.Lock()
+		defer n.serverMutex.Unlock()
+	}
+
+	client, err := newDockerClient()
+	if err != nil {
+		n.logger.Error("Failed to create Docker client", zap.Error(err))
+		return
+	}
+
+	err = client.StopContainer(n.containerID, 5) // 5 seconds timeout
+	if err != nil {
+		n.logger.Error("Failed to stop Docker container", zap.Error(err))
+		return
+	}
+
+	err = client.RemoveContainer(docker.RemoveContainerOptions{
+		ID:    n.containerID,
+		Force: true,
+	})
+	if err != nil {
+		n.logger.Error("Failed to remove Docker container", zap.Error(err))
+		return
+	}
+
+	n.containerID = ""
+
+	n.logger.Debug("Server stopped")
 }
 
 func (n *Nodejs) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	n.logger.Debug("Handling request")
-
-	if n.serverCmd == nil {
-		n.logger.Debug("n.serverCmd is nil")
-	} else if n.serverCmd.ProcessState == nil {
-		n.logger.Debug("n.serverCmd.ProcessState is nil")
-	} else {
-		n.logger.Debug("n.serverCmd state", zap.String("state", n.serverCmd.ProcessState.String()))
-	}
-
 	n.serverMutex.Lock()
 
-	if n.serverCmd == nil || n.serverStopped || (n.serverCmd.ProcessState != nil && n.serverCmd.ProcessState.Exited()) {
+	if n.containerID == "" {
 		n.logger.Debug("Starting new server")
-		err := n.startServer()
+		err := n.startServer(true)
 		if err != nil {
 			return fmt.Errorf("failed to start node.js server: %v", err)
 		}
-
-		select {
-		case <-time.After(5 * time.Second): // Adjust timeout duration as needed
-			n.logger.Debug("Waiting for n.serverReady timed out")
-			return fmt.Errorf("waiting for server to be ready timed out")
-		case <-func() chan struct{} {
-			done := make(chan struct{})
-			go func() {
-				n.serverReady.Wait()
-				close(done)
-			}()
-			return done
-		}():
-			n.logger.Debug("Waiting done for n.serverReady")
-		}
+	} else {
+		n.logger.Debug("Server is already up.")
 	}
 
 	// Update the lastActive field every time a request is handled
@@ -260,13 +221,13 @@ func (n *Nodejs) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	return nil
 }
 
-func (n *Nodejs) monitorIdleTime(pid int) {
+func (n *Nodejs) monitorIdleTime() {
 	for {
 		time.Sleep(60 * time.Second)
-		n.logger.Debug("Checking if server is idle", zap.Int("pid", pid))
+		n.logger.Debug("Checking if server is idle")
 		n.serverMutex.Lock()
 		if time.Since(n.lastActive) > n.timeout {
-			n.stopServer(pid, true)
+			n.stopServer(true)
 			n.serverMutex.Unlock()
 			break
 		}
@@ -279,10 +240,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	for h.Next() {
 		for h.NextBlock(0) {
 			switch h.Val() {
-			case "file":
-				if !h.AllArgs(&n.File) {
-					return nil, h.ArgErr()
-				}
 			case "port":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
@@ -292,6 +249,18 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 					return nil, h.Errf("invalid port: %v", err)
 				}
 				n.Port = port
+			case "app":
+				if !h.AllArgs(&n.App) {
+					return nil, h.ArgErr()
+				}
+			case "entrypoint":
+				if !h.AllArgs(&n.Entrypoint) {
+					return nil, h.ArgErr()
+				}
+			case "command":
+				if !h.AllArgs(&n.Command) {
+					return nil, h.ArgErr()
+				}
 			default:
 				return nil, h.Errf("unrecognized parameter '%s'", h.Val())
 			}
@@ -301,5 +270,6 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	if n.Port == 0 {
 		n.Port = 3000
 	}
+
 	return &n, nil
 }
