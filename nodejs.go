@@ -22,32 +22,36 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-type LogWriter struct {
-	logger *zap.Logger
-	level  zapcore.Level
-}
-
 type TimeStampedWriter struct {
 	underlying io.Writer
 }
 
 func (tsw *TimeStampedWriter) Write(p []byte) (n int, err error) {
-	msg := strings.TrimSpace(string(p))
-	if msg != "" {
-		formattedMsg := fmt.Sprintf("%s %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
-		return tsw.underlying.Write([]byte(formattedMsg))
+	timestamp := []byte(time.Now().Format("2006-01-02T15:04:05.999Z07:00"))
+	_, err = tsw.underlying.Write(append(timestamp, p...))
+	if err != nil {
+		return 0, err
 	}
 	return len(p), nil
 }
 
-func (w *LogWriter) Write(p []byte) (n int, err error) {
-	msg := strings.TrimSpace(string(p))
-	if msg != "" {
-		w.logger.Check(w.level, msg).Write()
-	}
-	return len(p), nil
+type LogWriter struct {
+	logger      *zap.Logger
+	level       zapcore.Level
+	logDataChan chan []byte
 }
 
+func (lw *LogWriter) Write(p []byte) (n int, err error) {
+	message := strings.TrimSpace(string(p))
+	if message != "" {
+		lw.logger.Check(lw.level, message).Write()
+	}
+
+	// Send the log data to the logDataChan channel
+	lw.logDataChan <- p
+
+	return len(p), nil
+}
 func init() {
 	caddy.RegisterModule(&Nodejs{})
 	httpcaddyfile.RegisterHandlerDirective("nodejs", parseCaddyfile)
@@ -64,7 +68,7 @@ type Nodejs struct {
 	serverAddr          string
 	timeout             time.Duration
 	logger              *zap.Logger
-	LogFileMap          map[int]*os.File
+	LogFile             *os.File
 	LogRotationDuration time.Duration
 }
 
@@ -100,11 +104,28 @@ func (n *Nodejs) startServer() error {
 	// Initialize the serverReady WaitGroup
 	n.serverReady.Add(1)
 
+	// Set the log rotation duration; you can customize this value as needed
+	n.LogRotationDuration = 1 * time.Hour
+
+	// Initialize the log file
+	if err := n.createLogFile(); err != nil {
+		return err
+	} else {
+		timeStampedLogFile := &TimeStampedWriter{underlying: n.LogFile}
+		stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel}
+		stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel}
+
+		n.serverCmd.Stdout = io.MultiWriter(timeStampedLogFile, stdoutLogWriter)
+		n.serverCmd.Stderr = io.MultiWriter(timeStampedLogFile, stderrLogWriter)
+
+		go n.rotateLogs()
+	}
+
 	// Start the server
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start server: %v", err)
 	}
-	n.logger.Debug("After cmd.Start()")
+	n.logger.Debug(fmt.Sprintf("Started server with Pid: %d", n.serverCmd.Process.Pid))
 
 	// Wait for the server to be ready in a separate goroutine
 	go func() {
@@ -132,29 +153,10 @@ func (n *Nodejs) startServer() error {
 	// Start monitoring the idle time of the server
 	go n.monitorIdleTime(n.serverCmd.Process.Pid)
 
-	// Set the log rotation duration; you can customize this value as needed
-	n.LogRotationDuration = 1 * time.Hour
-
-	// Initialize the log file map
-	n.LogFileMap = make(map[int]*os.File)
-
-	if err := n.createLogFile(n.serverCmd.Process.Pid); err != nil {
-		return err
-	}
-
-	timeStampedLogFile := &TimeStampedWriter{underlying: n.LogFileMap[n.serverCmd.Process.Pid]}
-	stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel}
-	stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel}
-
-	n.serverCmd.Stdout = io.MultiWriter(timeStampedLogFile, stdoutLogWriter)
-	n.serverCmd.Stderr = io.MultiWriter(timeStampedLogFile, stderrLogWriter)
-
-	go n.rotateLogs(n.serverCmd.Process.Pid)
-
 	return nil
 }
 
-func (n *Nodejs) createLogFile(pid int) error {
+func (n *Nodejs) createLogFile() error {
 	parentFolder := filepath.Base(filepath.Dir(n.File))
 	logFileName := fmt.Sprintf("%s_server_%d_%s.log", parentFolder, n.Port, time.Now().Format("20060102"))
 	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -162,47 +164,69 @@ func (n *Nodejs) createLogFile(pid int) error {
 		return fmt.Errorf("failed to create log file: %v", err)
 	}
 
-	n.LogFileMap[pid] = logFile
+	n.LogFile = logFile
 	return nil
 }
 
-func (n *Nodejs) rotateLogs(pid int) {
+func (n *Nodejs) rotateLogs() {
 	var logFileCount int
+
+	// Create a ticker for log rotation
+	ticker := time.NewTicker(n.LogRotationDuration)
+	defer ticker.Stop()
+
+	// Create a channel for incoming log data
+	logDataChan := make(chan []byte)
+
+	// Modify the LogWriter struct to include the logDataChan channel
+	stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel, logDataChan: logDataChan}
+	stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel, logDataChan: logDataChan}
+
+	n.serverCmd.Stdout = io.MultiWriter(stdoutLogWriter)
+	n.serverCmd.Stderr = io.MultiWriter(stderrLogWriter)
+
 	for {
-		// Sleep for the log rotation duration
-		time.Sleep(n.LogRotationDuration)
-
-		// Close the current log file
-		if logFile, ok := n.LogFileMap[pid]; ok {
-			logFile.Close()
-		}
-
-		// Create a new log file with a name based on the current timestamp
-		if err := n.createLogFile(pid); err != nil {
-			n.logger.Error("Failed to create new log file during rotation", zap.Int("pid", pid), zap.Error(err))
-			continue
-		}
-
-		// Delete old log files
-		logFileCount++
-		if logFileCount > 24 {
-			if err := n.deleteOldLogFiles(); err != nil {
-				n.logger.Error("Failed to delete old log files", zap.Error(err))
+		select {
+		case <-ticker.C:
+			// Close the current log file
+			if n.LogFile != nil {
+				n.LogFile.Close()
 			}
-			logFileCount = 1
-		}
 
-		// Update the serverCmd stdout and stderr to the new log file
-		n.serverMutex.Lock()
-		if n.serverCmd != nil && n.serverCmd.Process != nil && n.serverCmd.Process.Pid == pid {
-			timeStampedLogFile := &TimeStampedWriter{underlying: n.LogFileMap[pid]}
-			stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel}
-			stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel}
+			// Create a new log file with a name based on the current timestamp
+			if err := n.createLogFile(); err != nil {
+				n.logger.Error("Failed to create new log file during rotation", zap.Int("pid", pid), zap.Error(err))
+				continue
+			}
 
-			n.serverCmd.Stdout = io.MultiWriter(timeStampedLogFile, stdoutLogWriter)
-			n.serverCmd.Stderr = io.MultiWriter(timeStampedLogFile, stderrLogWriter)
+			// Delete old log files
+			logFileCount++
+			if logFileCount > 24 {
+				if err := n.deleteOldLogFiles(); err != nil {
+					n.logger.Error("Failed to delete old log files", zap.Error(err))
+				}
+				logFileCount = 1
+			}
+
+			// Update the serverCmd stdout and stderr to the new log file
+			n.serverMutex.Lock()
+			if n.serverCmd != nil && n.serverCmd.Process != nil && n.serverCmd.Process.Pid == pid {
+				timeStampedLogFile := &TimeStampedWriter{underlying: n.LogFile}
+				stdoutLogWriter := &LogWriter{logger: n.logger, level: zap.InfoLevel}
+				stderrLogWriter := &LogWriter{logger: n.logger, level: zap.ErrorLevel}
+
+				n.serverCmd.Stdout = io.MultiWriter(timeStampedLogFile, stdoutLogWriter)
+				n.serverCmd.Stderr = io.MultiWriter(timeStampedLogFile, stderrLogWriter)
+			}
+			n.serverMutex.Unlock()
+
+		case logData := <-logDataChan:
+			// Write the incoming log data to the timeStampedLogFile
+			if n.LogFile != nil {
+				timeStampedLogFile := &TimeStampedWriter{underlying: n.LogFile}
+				timeStampedLogFile.Write(logData)
+			}
 		}
-		n.serverMutex.Unlock()
 	}
 }
 
