@@ -1,5 +1,6 @@
 {
 	debug
+	grace_period 5s
 	order nodejs first
 }
 
