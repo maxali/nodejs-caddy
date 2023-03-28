@@ -45,14 +45,14 @@ Here's an example Caddyfile:
 
 ```
 http://localhost:8080 {
-		route {
+    route {
         nodejs {
                 app /path/to/your/nodejs/app
                 entrypoint node
                 command server.js
                 port 3000
         }
-		}
+    }
 }
 ```
 
@@ -62,25 +62,25 @@ You can also configure multiple instances of Node.js applications, each with its
 
 ```
 http://localhost:8080 {
-		route {
+    route {
         nodejs {
                 app /path/to/your/nodejs/app1
                 entrypoint node
                 command server.js
                 port 3000
         }
-		}
+    }
 }
 
 http://localhost:8081 {
-		route {
+    route {
         nodejs {
                 app /path/to/your/nodejs/app2
                 entrypoint node
                 command server.js
                 port 3001
         }
-		}
+    }
 }
 ```
 
